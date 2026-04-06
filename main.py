@@ -90,17 +90,15 @@ app.add_middleware(
 )
 
 # ================= AUTH =================
-pwd_context = CryptContext(schemes=["bcrypt"])
+pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 
 def hash_password(pw):
-    pw_hash = hashlib.sha256(pw.encode()).hexdigest()
-    return pwd_context.hash(pw_hash)
+    return pwd_context.hash(pw)
 
 def verify_password(pw, hashed):
-    pw_hash = hashlib.sha256(pw.encode()).hexdigest()
-    return pwd_context.verify(pw_hash, hashed)
+    return pwd_context.verify(pw, hashed)
 
 def create_token(data):
     data["exp"] = datetime.utcnow() + timedelta(minutes=60)
