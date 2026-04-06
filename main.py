@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy import create_engine, Column, Integer, String, DateTime
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
@@ -9,12 +9,10 @@ from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from pydantic import BaseModel
 import os, cv2, numpy as np, time, requests
-import hashlib
 
 # ================= CONFIG =================
-SECRET_KEY = "SUPER_SECRET_KEY" 
+SECRET_KEY = "SUPER_SECRET_KEY"
 ALGORITHM = "HS256"
-ESP32_STREAM_URL = "http://192.168.1.50/live"
 DATABASE_URL = "sqlite:///./camera.db"
 
 UPLOAD_DIR = "uploads"
@@ -25,12 +23,11 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(UNKNOWN_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# ================= GOOGLE DRIVE DOWNLOAD =================
+# ================= MODEL DOWNLOAD =================
 def download_drive_file(file_id, destination):
     if os.path.exists(destination):
         return
 
-    print(f"Downloading {destination}...")
     URL = "https://drive.google.com/uc?export=download"
     session = requests.Session()
 
@@ -54,12 +51,10 @@ FACE_PROTO_PATH = f"{MODEL_DIR}/deploy.prototxt"
 FACE_MODEL_PATH = f"{MODEL_DIR}/res10.caffemodel"
 EMBED_MODEL_PATH = f"{MODEL_DIR}/openface.t7"
 
-# 🔁 REPLACE WITH YOUR FILE IDs
 FACE_PROTO_ID = "1eq0loGlVgjR6W8-CZ8Qrbc2fHZxo2207"
 FACE_MODEL_ID = "14iQZzrsU_MB8IRLCTZyXmQBjZtyB0lCz"
 EMBED_MODEL_ID = "1l7eEf-YJ6cHEw7tZ1EFjgDKjhaVwwhyr"
 
-# ================= LOAD MODELS =================
 detector = None
 embedder = None
 
@@ -92,7 +87,6 @@ app.add_middleware(
 # ================= AUTH =================
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
-
 
 def hash_password(pw):
     return pwd_context.hash(pw)
@@ -145,7 +139,7 @@ def get_db():
     finally:
         db.close()
 
-# ================= INIT =================
+# ================= STARTUP =================
 @app.on_event("startup")
 def startup():
     load_models()
@@ -156,12 +150,11 @@ def startup():
         db.commit()
     db.close()
 
-# ================= REQUEST SCHEMAS =================
+# ================= AUTH ROUTES =================
 class UserCreate(BaseModel):
     username: str
     password: str
 
-# ================= AUTH ROUTES =================
 @app.post("/register")
 def register(data: UserCreate, db: Session = Depends(get_db)):
     if db.query(User).filter_by(username=data.username).first():
@@ -192,13 +185,9 @@ def detect_faces(frame):
         if conf > 0.6:
             box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
             x1, y1, x2, y2 = box.astype(int)
-
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(w, x2), min(h, y2)
-
             face = frame[y1:y2, x1:x2]
             if face.size > 0:
-                faces.append((face, (x1, y1, x2, y2)))
+                faces.append(face)
     return faces
 
 def get_embedding(face):
@@ -213,14 +202,7 @@ def match_face(embedding, db):
             return f.name
     return "Unknown"
 
-# ================= SAFE FILE HELPER =================
-def get_latest_image():
-    files = sorted(os.listdir(UPLOAD_DIR))
-    if not files:
-        return None
-    return os.path.join(UPLOAD_DIR, files[-1])
-
-# ================= ROUTES =================
+# ================= UPLOAD (CORE LOGIC) =================
 @app.post("/upload")
 async def upload(request: Request, db: Session = Depends(get_db)):
     body = await request.body()
@@ -232,77 +214,37 @@ async def upload(request: Request, db: Session = Depends(get_db)):
 
     db.add(ImageLog(filename=filename))
     db.commit()
-    return {"file": filename}
 
-@app.post("/create-embedding")
-def create_embedding(name: str, db: Session = Depends(get_db)):
-    path = get_latest_image()
-    if not path:
-        return {"error": "No images"}
-
+    # 🔥 AI PROCESSING
     img = cv2.imread(path)
     faces = detect_faces(img)
 
-    if not faces:
-        return {"error": "No face"}
+    result = "no face"
+    name = None
 
-    emb = get_embedding(faces[0][0])
-    db.add(Face(name=name, embedding=",".join(map(str, emb))))
-    db.commit()
+    if faces:
+        emb = get_embedding(faces[0])
+        name = match_face(emb, db)
+        result = "known" if name != "Unknown" else "unknown"
 
-    return {"msg": f"{name} saved"}
+        if result == "unknown":
+            cv2.imwrite(os.path.join(UNKNOWN_DIR, filename), img)
 
-@app.get("/recognize")
-def recognize(db: Session = Depends(get_db)):
-    path = get_latest_image()
-    if not path:
-        return {"error": "No images"}
+    return {"status": result, "name": name}
 
-    img = cv2.imread(path)
-    faces = detect_faces(img)
+# ================= LIVE FRAME =================
+@app.get("/latest-frame")
+def latest_frame():
+    files = sorted(os.listdir(UPLOAD_DIR))
+    if not files:
+        return {"error": "no frames"}
 
-    if not faces:
-        return {"status": "no face"}
+    path = os.path.join(UPLOAD_DIR, files[-1])
+    return FileResponse(path, media_type="image/jpeg")
 
-    name = match_face(get_embedding(faces[0][0]), db)
-    return {"status": "known" if name != "Unknown" else "unknown", "name": name}
-
-# ================= STREAM =================
-def gen_frames(db):
-    cap = cv2.VideoCapture(ESP32_STREAM_URL)
-    last_save = 0
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            time.sleep(1)
-            continue
-
-        for face, (x1,y1,x2,y2) in detect_faces(frame):
-            name = match_face(get_embedding(face), db)
-
-            if name == "Unknown" and time.time() - last_save > 5:
-                cv2.imwrite(os.path.join(UNKNOWN_DIR, f"{time.time()}.jpg"), frame)
-                last_save = time.time()
-
-            cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
-            cv2.putText(frame, name, (x1,y1-10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
-
-        _, buffer = cv2.imencode(".jpg", frame)
-        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' +
-               buffer.tobytes() + b'\r\n')
-
-@app.get("/video_feed")
-def video_feed(db: Session = Depends(get_db)):
-    return StreamingResponse(gen_frames(db),
-        media_type="multipart/x-mixed-replace; boundary=frame")
-
+# ================= COMMAND =================
 @app.post("/set-command")
 def set_command(mode: str, db: Session = Depends(get_db)):
-    if mode not in ["stream", "capture", "idle"]:
-        raise HTTPException(400, "Invalid mode")
-
     cmd = db.query(Command).first()
     if not cmd:
         cmd = Command(mode=mode)
@@ -312,12 +254,13 @@ def set_command(mode: str, db: Session = Depends(get_db)):
 
     db.commit()
     return {"mode": mode}
-    
+
 @app.get("/camera/command")
 def get_command(db: Session = Depends(get_db)):
     cmd = db.query(Command).first()
     return cmd.mode if cmd else "idle"
 
+# ================= HEALTH =================
 @app.get("/ping")
 def ping():
     return {"status": "alive"}
