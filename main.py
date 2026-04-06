@@ -287,7 +287,7 @@ async def broadcast_to_clients(message: str):
 
 # ================= COMMAND =================
 @app.post("/set-command")
-def set_command(
+async def set_command(
     mode: str,
     user: str = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -308,13 +308,12 @@ def set_command(
     
     # Send command to ESP32 via WebSocket
     if esp32_socket and esp32_connected:
-        asyncio.create_task(esp32_socket.send_text(mode))
+        await esp32_socket.send_text(mode)  # Now works because function is async
     
-    # Notify frontend clients
+    # Notify frontend clients - use asyncio.create_task properly in async context
     asyncio.create_task(broadcast_to_clients(f"mode:{mode}"))
 
     return {"mode": mode}
-
 # ================= AUTH ROUTES =================
 class UserCreate(BaseModel):
     username: str
