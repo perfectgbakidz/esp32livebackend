@@ -7,3 +7,4 @@ python-jose
 passlib[bcrypt]
 requests
 python-multipart
+argon2-cffi
