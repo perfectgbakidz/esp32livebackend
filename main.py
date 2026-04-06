@@ -10,15 +10,13 @@ from datetime import datetime, timedelta
 import os
 import cv2
 import numpy as np
-import face_recognition
 import time
 
 # ================= CONFIG =================
 SECRET_KEY = "SUPER_SECRET_KEY"
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
-ESP32_STREAM_URL = "http://192.168.1.50/live"  # 🔥 CHANGE THIS
+ESP32_STREAM_URL = "http://192.168.1.50/live"
 
 DATABASE_URL = "sqlite:///./camera.db"
 
@@ -28,13 +26,22 @@ UNKNOWN_DIR = "unknown"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(UNKNOWN_DIR, exist_ok=True)
 
-# ================= DB SETUP =================
+# ================= LOAD MODELS =================
+FACE_PROTO = "models/deploy.prototxt"
+FACE_MODEL = "models/res10_300x300_ssd_iter_140000.caffemodel"
+EMBED_MODEL = "models/nn4.small2.v1.t7"
+
+detector = cv2.dnn.readNetFromCaffe(FACE_PROTO, FACE_MODEL)
+embedder = cv2.dnn.readNetFromTorch(EMBED_MODEL)
+
+# ================= DB =================
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
 # ================= APP =================
 app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -42,6 +49,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 # ================= AUTH =================
 pwd_context = CryptContext(schemes=["bcrypt"])
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
@@ -53,17 +61,15 @@ def verify_password(pw, hashed):
     return pwd_context.verify(pw, hashed)
 
 def create_token(data):
-    to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    data["exp"] = datetime.utcnow() + timedelta(minutes=60)
+    return jwt.encode(data, SECRET_KEY, algorithm=ALGORITHM)
 
 def get_current_user(token: str = Depends(oauth2_scheme)):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         return payload["sub"]
     except:
-        raise HTTPException(status_code=401, detail="Invalid token")
+        raise HTTPException(401, "Invalid token")
 
 # ================= MODELS =================
 class User(Base):
@@ -71,11 +77,6 @@ class User(Base):
     id = Column(Integer, primary_key=True)
     username = Column(String, unique=True)
     password = Column(String)
-
-class Command(Base):
-    __tablename__ = "command"
-    id = Column(Integer, primary_key=True)
-    mode = Column(String, default="idle")
 
 class Face(Base):
     __tablename__ = "faces"
@@ -89,6 +90,11 @@ class ImageLog(Base):
     filename = Column(String)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class Command(Base):
+    __tablename__ = "command"
+    id = Column(Integer, primary_key=True)
+    mode = Column(String, default="idle")
+
 Base.metadata.create_all(bind=engine)
 
 # ================= DB DEP =================
@@ -101,7 +107,7 @@ def get_db():
 
 # ================= INIT =================
 @app.on_event("startup")
-def startup():
+def init():
     db = SessionLocal()
     if not db.query(Command).first():
         db.add(Command(mode="idle"))
@@ -111,165 +117,147 @@ def startup():
 # ================= AUTH ROUTES =================
 @app.post("/register")
 def register(username: str, password: str, db: Session = Depends(get_db)):
-    user = User(username=username, password=hash_password(password))
-    db.add(user)
+    db.add(User(username=username, password=hash_password(password)))
     db.commit()
     return {"msg": "registered"}
 
 @app.post("/login")
 def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.username == form.username).first()
+    user = db.query(User).filter_by(username=form.username).first()
     if not user or not verify_password(form.password, user.password):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+        raise HTTPException(401, "Invalid credentials")
 
     token = create_token({"sub": user.username})
-    return {"access_token": token, "token_type": "bearer"}
+    return {"access_token": token}
 
 # ================= COMMAND =================
 @app.post("/set-command")
-def set_command(mode: str, user: str = Depends(get_current_user), db: Session = Depends(get_db)):
-    if mode not in ["stream", "capture", "idle"]:
-        raise HTTPException(400, "Invalid mode")
-
+def set_command(mode: str, user=Depends(get_current_user), db: Session = Depends(get_db)):
     cmd = db.query(Command).first()
     cmd.mode = mode
     db.commit()
-
     return {"mode": mode}
 
 @app.get("/camera/command")
 def get_command(db: Session = Depends(get_db)):
-    cmd = db.query(Command).first()
-    return cmd.mode if cmd else "idle"
+    return db.query(Command).first().mode
 
 # ================= UPLOAD =================
 @app.post("/upload")
-async def upload_image(request: Request, db: Session = Depends(get_db)):
+async def upload(request: Request, db: Session = Depends(get_db)):
     body = await request.body()
-
-    filename = f"{int(datetime.utcnow().timestamp())}.jpg"
+    filename = f"{int(time.time())}.jpg"
     path = os.path.join(UPLOAD_DIR, filename)
 
     with open(path, "wb") as f:
         f.write(body)
 
-    log = ImageLog(filename=filename)
-    db.add(log)
+    db.add(ImageLog(filename=filename))
     db.commit()
 
     return {"file": filename}
 
-# ================= EMBEDDING =================
-def extract_embedding(path):
-    img = face_recognition.load_image_file(path)
-    encodings = face_recognition.face_encodings(img)
-    return encodings[0] if encodings else None
+# ================= FACE UTILS =================
+def get_embedding(face):
+    face_blob = cv2.dnn.blobFromImage(face, 1/255, (96, 96), (0,0,0), swapRB=True)
+    embedder.setInput(face_blob)
+    return embedder.forward()[0]
 
+def detect_faces(frame):
+    h, w = frame.shape[:2]
+    blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300), (104, 177, 123))
+    detector.setInput(blob)
+    detections = detector.forward()
+
+    faces = []
+    for i in range(detections.shape[2]):
+        conf = detections[0, 0, i, 2]
+        if conf > 0.6:
+            box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+            (x1, y1, x2, y2) = box.astype("int")
+            face = frame[y1:y2, x1:x2]
+            if face.size > 0:
+                faces.append((face, (x1,y1,x2,y2)))
+    return faces
+
+def match_face(embedding, db):
+    faces = db.query(Face).all()
+    for f in faces:
+        stored = np.fromstring(f.embedding, sep=",")
+        dist = np.linalg.norm(stored - embedding)
+        if dist < 0.6:
+            return f.name
+    return "Unknown"
+
+# ================= CREATE EMBEDDING =================
 @app.post("/create-embedding")
-def create_embedding(name: str, user: str = Depends(get_current_user), db: Session = Depends(get_db)):
-    images = os.listdir(UPLOAD_DIR)
-    if not images:
-        return {"error": "No images"}
-
-    latest = sorted(images)[-1]
+def create_embedding(name: str, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    latest = sorted(os.listdir(UPLOAD_DIR))[-1]
     path = os.path.join(UPLOAD_DIR, latest)
 
-    emb = extract_embedding(path)
-    if emb is None:
-        return {"error": "No face detected"}
+    img = cv2.imread(path)
+    faces = detect_faces(img)
 
-    face = Face(name=name, embedding=np.array2string(emb))
-    db.add(face)
+    if not faces:
+        return {"error": "No face"}
+
+    emb = get_embedding(faces[0][0])
+    db.add(Face(name=name, embedding=",".join(map(str, emb))))
     db.commit()
 
     return {"msg": f"{name} saved"}
 
-# ================= RECOGNITION =================
+# ================= RECOGNIZE =================
 @app.get("/recognize")
 def recognize(db: Session = Depends(get_db)):
-    images = os.listdir(UPLOAD_DIR)
-    if not images:
-        return {"error": "No images"}
+    latest = sorted(os.listdir(UPLOAD_DIR))[-1]
+    img = cv2.imread(os.path.join(UPLOAD_DIR, latest))
 
-    latest = sorted(images)[-1]
-    path = os.path.join(UPLOAD_DIR, latest)
+    faces = detect_faces(img)
+    if not faces:
+        return {"status": "no face"}
 
-    emb = extract_embedding(path)
-    if emb is None:
-        return {"status": "No face"}
+    emb = get_embedding(faces[0][0])
+    name = match_face(emb, db)
 
-    faces = db.query(Face).all()
+    return {"status": "known" if name!="Unknown" else "unknown", "name": name}
 
-    for f in faces:
-        stored = np.fromstring(f.embedding.strip("[]"), sep=' ')
-        match = face_recognition.compare_faces([stored], emb)
-
-        if match[0]:
-            return {"status": "known", "name": f.name}
-
-    return {"status": "unknown"}
-
-# ================= LIVE VIDEO WITH AI =================
-def gen_frames(db: Session):
+# ================= VIDEO STREAM =================
+def gen_frames(db):
     cap = cv2.VideoCapture(ESP32_STREAM_URL)
 
-    frame_count = 0
-
     while True:
-        success, frame = cap.read()
-        if not success:
+        ret, frame = cap.read()
+        if not ret:
             break
 
-        frame_count += 1
+        faces = detect_faces(frame)
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        for face, (x1,y1,x2,y2) in faces:
+            emb = get_embedding(face)
+            name = match_face(emb, db)
 
-        # Optimize: detect every 5 frames
-        if frame_count % 5 == 0:
-            face_locations = face_recognition.face_locations(rgb)
-            encodings = face_recognition.face_encodings(rgb, face_locations)
+            if name == "Unknown":
+                cv2.imwrite(os.path.join(UNKNOWN_DIR, f"{time.time()}.jpg"), frame)
 
-            faces_db = db.query(Face).all()
+            cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
+            cv2.putText(frame, name, (x1,y1-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
 
-            for (top, right, bottom, left), face_enc in zip(face_locations, encodings):
-                name = "Unknown"
+        _, buffer = cv2.imencode(".jpg", frame)
 
-                for f in faces_db:
-                    stored = np.fromstring(f.embedding.strip("[]"), sep=' ')
-                    match = face_recognition.compare_faces([stored], face_enc)
-
-                    if match[0]:
-                        name = f.name
-                        break
-
-                # Save unknown faces
-                if name == "Unknown":
-                    filename = f"{int(time.time())}.jpg"
-                    cv2.imwrite(os.path.join(UNKNOWN_DIR, filename), frame)
-
-                # Draw
-                cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
-                cv2.putText(frame, name, (left, top - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-        _, buffer = cv2.imencode('.jpg', frame)
         yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' +
                buffer.tobytes() + b'\r\n')
 
-        time.sleep(0.03)
-
 @app.get("/video_feed")
 def video_feed(db: Session = Depends(get_db)):
-    return StreamingResponse(
-        gen_frames(db),
-        media_type="multipart/x-mixed-replace; boundary=frame"
-    )
+    return StreamingResponse(gen_frames(db),
+        media_type="multipart/x-mixed-replace; boundary=frame")
 
-# ================= LIST IMAGES =================
+# ================= IMAGES =================
 @app.get("/images")
-def list_images(db: Session = Depends(get_db)):
-    imgs = db.query(ImageLog).all()
-    return [{"file": i.filename, "time": i.created_at} for i in imgs]
+def images(db: Session = Depends(get_db)):
+    return db.query(ImageLog).all()
 
 # ================= HEALTH =================
 @app.get("/ping")
