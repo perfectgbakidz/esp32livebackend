@@ -8,3 +8,5 @@ passlib[bcrypt]
 requests
 python-multipart
 argon2-cffi
+uvicorn[standard]
+websockets>=10.0
