@@ -158,46 +158,70 @@ def startup():
     db.close()
     print("Server started, WebSocket at /ws/mjpeg")
 
-# ================= WEBSOCKET ENDPOINTS (BEFORE OTHER ROUTES) =================
+# ================= WEBSOCKET ENDPOINTS =================
 
 @app.websocket("/ws/mjpeg")
 async def websocket_mjpeg(websocket: WebSocket):
-    """ESP32 MJPEG streaming endpoint"""
+    """ESP32 MJPEG streaming endpoint with keepalive handling"""
     global mjpeg_buffer, esp32_connected, esp32_socket
     
     print(f"WS connection from {websocket.client}")
+    
+    # Accept with custom ping interval (30 seconds) and no timeout
     await websocket.accept()
+    
+    # Configure WebSocket to be more tolerant
     esp32_socket = websocket
     esp32_connected = True
     print("ESP32 connected")
     
     try:
         while True:
-            message = await websocket.receive()
-            
-            if "text" in message:
-                text = message["text"]
-                print(f"ESP32: {text}")
-                    
-            elif "bytes" in message:
-                data = message["bytes"]
+            # Use timeout to allow periodic checks
+            try:
+                message = await asyncio.wait_for(
+                    websocket.receive(), 
+                    timeout=25.0  # Slightly less than 30s ping interval
+                )
                 
-                async with mjpeg_lock:
-                    mjpeg_buffer.extend(data)
-                    if len(mjpeg_buffer) > 2000000:
-                        mjpeg_buffer = mjpeg_buffer[-1500000:]
-                
-                frames = extract_frames_from_mjpeg(bytes(mjpeg_buffer))
-                if frames:
-                    await save_frame_for_processing(frames[-1])
+                if "text" in message:
+                    text = message["text"]
+                    print(f"ESP32: {text}")
                     
+                    # Handle pong response
+                    if text == "pong":
+                        continue
+                        
+                elif "bytes" in message:
+                    data = message["bytes"]
+                    
+                    async with mjpeg_lock:
+                        mjpeg_buffer.extend(data)
+                        if len(mjpeg_buffer) > 2000000:
+                            mjpeg_buffer = mjpeg_buffer[-1500000:]
+                    
+                    frames = extract_frames_from_mjpeg(bytes(mjpeg_buffer))
+                    if frames:
+                        await save_frame_for_processing(frames[-1])
+                        
+            except asyncio.TimeoutError:
+                # Send ping to check if ESP32 is alive
+                if esp32_socket and esp32_connected:
+                    try:
+                        await esp32_socket.send_text("ping")
+                    except:
+                        print("Failed to send ping, connection dead")
+                        break
+                continue
+                
     except WebSocketDisconnect:
-        print("ESP32 disconnected")
+        print("ESP32 disconnected cleanly")
     except Exception as e:
         print(f"WS error: {e}")
     finally:
         esp32_connected = False
         esp32_socket = None
+        print("ESP32 connection cleanup complete")
 
 @app.websocket("/ws/client")
 async def websocket_client(websocket: WebSocket):
@@ -273,7 +297,7 @@ async def broadcast_to_clients(message: str):
         if client in active_clients:
             active_clients.remove(client)
 
-# ================= COMMAND (FIXED - ASYNC) =================
+# ================= COMMAND =================
 @app.post("/set-command")
 async def set_command(
     mode: str,
