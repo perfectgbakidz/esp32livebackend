@@ -1,5 +1,5 @@
 # ================= IMPORTS =================
-from fastapi import FastAPI, Request, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, Depends, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -27,10 +27,10 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(UNKNOWN_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# ================= STATIC =================
+# ================= APP SETUP =================
 app = FastAPI()
-app.mount("/static/images", StaticFiles(directory=UPLOAD_DIR), name="images")
 
+# CORS first
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -39,15 +39,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Static files
+app.mount("/static/images", StaticFiles(directory=UPLOAD_DIR), name="images")
+
 # ================= GLOBAL STATE =================
-# MJPEG streaming state
 mjpeg_buffer = bytearray()
 mjpeg_lock = asyncio.Lock()
 frame_event = asyncio.Event()
 latest_frame_path: Optional[str] = None
 esp32_connected = False
-
-# Active WebSocket clients
 active_clients: List[WebSocket] = []
 esp32_socket: Optional[WebSocket] = None
 
@@ -156,41 +156,20 @@ def startup():
         db.add(Command(mode="idle"))
         db.commit()
     db.close()
+    print("Server started, WebSocket at /ws/mjpeg")
 
-# ================= MJPEG PARSING =================
-BOUNDARY = b"--123456789000000000000987654321"
+# ================= WEBSOCKET ENDPOINTS (BEFORE OTHER ROUTES) =================
 
-def extract_frames_from_mjpeg(data: bytes) -> list:
-    """Extract individual JPEG frames from MJPEG stream"""
-    frames = []
-    parts = data.split(BOUNDARY)
-    
-    for part in parts:
-        if b"Content-Type: image/jpeg" in part:
-            # Find the double CRLF that separates headers from body
-            header_end = part.find(b"\r\n\r\n")
-            if header_end != -1:
-                jpeg_data = part[header_end + 4:]  # Skip \r\n\r\n
-                # Remove trailing \r\n if present
-                if jpeg_data.endswith(b"\r\n"):
-                    jpeg_data = jpeg_data[:-2]
-                if jpeg_data.startswith(b"\r\n"):
-                    jpeg_data = jpeg_data[2:]
-                if len(jpeg_data) > 100:  # Valid JPEG check
-                    frames.append(jpeg_data)
-    
-    return frames
-
-# ================= ESP32 WEBSOCKET (MJPEG STREAM) =================
 @app.websocket("/ws/mjpeg")
 async def websocket_mjpeg(websocket: WebSocket):
+    """ESP32 MJPEG streaming endpoint"""
     global mjpeg_buffer, esp32_connected, esp32_socket
     
+    print(f"WS connection from {websocket.client}")
     await websocket.accept()
     esp32_socket = websocket
     esp32_connected = True
-    
-    print("ESP32 MJPEG client connected")
+    print("ESP32 connected")
     
     try:
         while True:
@@ -198,39 +177,65 @@ async def websocket_mjpeg(websocket: WebSocket):
             
             if "text" in message:
                 text = message["text"]
-                print(f"ESP32 Text: {text}")
-                
-                if "MJPEG_READY" in text:
-                    # ESP32 is ready to stream
-                    pass
+                print(f"ESP32: {text}")
                     
             elif "bytes" in message:
                 data = message["bytes"]
                 
                 async with mjpeg_lock:
                     mjpeg_buffer.extend(data)
-                    
-                    # Keep buffer size manageable (last ~2MB)
                     if len(mjpeg_buffer) > 2000000:
                         mjpeg_buffer = mjpeg_buffer[-1500000:]
                 
-                # Extract and save latest frame for processing
                 frames = extract_frames_from_mjpeg(bytes(mjpeg_buffer))
                 if frames:
-                    latest_frame = frames[-1]
-                    await save_frame_for_processing(latest_frame)
+                    await save_frame_for_processing(frames[-1])
                     
-                # Notify waiting clients
-                frame_event.set()
-                frame_event.clear()
-                
     except WebSocketDisconnect:
-        print("ESP32 MJPEG client disconnected")
+        print("ESP32 disconnected")
+    except Exception as e:
+        print(f"WS error: {e}")
+    finally:
         esp32_connected = False
         esp32_socket = None
 
+@app.websocket("/ws/client")
+async def websocket_client(websocket: WebSocket):
+    """Frontend notifications"""
+    await websocket.accept()
+    active_clients.append(websocket)
+    print(f"Frontend connected, total: {len(active_clients)}")
+    
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        if websocket in active_clients:
+            active_clients.remove(websocket)
+        print(f"Frontend disconnected, total: {len(active_clients)}")
+
+# ================= MJPEG PARSING =================
+BOUNDARY = b"--123456789000000000000987654321"
+
+def extract_frames_from_mjpeg(data: bytes) -> list:
+    frames = []
+    parts = data.split(BOUNDARY)
+    
+    for part in parts:
+        if b"Content-Type: image/jpeg" in part:
+            header_end = part.find(b"\r\n\r\n")
+            if header_end != -1:
+                jpeg_data = part[header_end + 4:]
+                if jpeg_data.endswith(b"\r\n"):
+                    jpeg_data = jpeg_data[:-2]
+                if jpeg_data.startswith(b"\r\n"):
+                    jpeg_data = jpeg_data[2:]
+                if len(jpeg_data) > 100:
+                    frames.append(jpeg_data)
+    
+    return frames
+
 async def save_frame_for_processing(jpeg_data: bytes):
-    """Save latest frame to disk for face recognition"""
     global latest_frame_path
     
     filename = f"latest_{int(time.time())}.jpg"
@@ -241,7 +246,6 @@ async def save_frame_for_processing(jpeg_data: bytes):
     
     latest_frame_path = path
     
-    # Cleanup old files, keep last 50
     files = sorted(os.listdir(UPLOAD_DIR))
     if len(files) > 50:
         for old_file in files[:-50]:
@@ -250,7 +254,6 @@ async def save_frame_for_processing(jpeg_data: bytes):
             except:
                 pass
     
-    # Log to DB
     db = SessionLocal()
     try:
         db.add(ImageLog(filename=filename))
@@ -258,21 +261,6 @@ async def save_frame_for_processing(jpeg_data: bytes):
     finally:
         db.close()
 
-# ================= FRONTEND WEBSOCKET (for commands/notifications) =================
-@app.websocket("/ws/client")
-async def websocket_client(websocket: WebSocket):
-    await websocket.accept()
-    active_clients.append(websocket)
-    
-    try:
-        while True:
-            # Keep connection alive, handle client commands if needed
-            data = await websocket.receive_text()
-            # Handle client->server messages if needed
-    except WebSocketDisconnect:
-        active_clients.remove(websocket)
-
-# ================= BROADCAST =================
 async def broadcast_to_clients(message: str):
     disconnected = []
     for client in active_clients:
@@ -285,7 +273,7 @@ async def broadcast_to_clients(message: str):
         if client in active_clients:
             active_clients.remove(client)
 
-# ================= COMMAND =================
+# ================= COMMAND (FIXED - ASYNC) =================
 @app.post("/set-command")
 async def set_command(
     mode: str,
@@ -306,14 +294,17 @@ async def set_command(
 
     db.commit()
     
-    # Send command to ESP32 via WebSocket
     if esp32_socket and esp32_connected:
-        await esp32_socket.send_text(mode)  # Now works because function is async
+        try:
+            await esp32_socket.send_text(mode)
+            print(f"Sent {mode} to ESP32")
+        except Exception as e:
+            print(f"Send failed: {e}")
     
-    # Notify frontend clients - use asyncio.create_task properly in async context
-    asyncio.create_task(broadcast_to_clients(f"mode:{mode}"))
+    await broadcast_to_clients(f"mode:{mode}")
 
     return {"mode": mode}
+
 # ================= AUTH ROUTES =================
 class UserCreate(BaseModel):
     username: str
@@ -337,38 +328,28 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
 # ================= VIDEO STREAMING =================
 @app.get("/video-feed")
 async def video_feed():
-    """HTTP MJPEG stream for frontend"""
     async def generate():
-        last_sent = 0
+        last_hash = 0
         while True:
             async with mjpeg_lock:
                 current_buffer = bytes(mjpeg_buffer)
             
-            # Extract frames
             frames = extract_frames_from_mjpeg(current_buffer)
             
-            if frames and len(frames) > last_sent:
-                # Send new frames only
-                for i in range(last_sent, len(frames)):
-                    frame = frames[i]
+            if frames:
+                latest = frames[-1]
+                current_hash = hash(latest) & 0xFFFFFFFF
+                
+                if current_hash != last_hash:
                     yield (
                         b"--frame\r\n"
                         b"Content-Type: image/jpeg\r\n"
-                        b"Content-Length: " + str(len(frame)).encode() + b"\r\n"
-                        b"\r\n" + frame + b"\r\n"
+                        b"Content-Length: " + str(len(latest)).encode() + b"\r\n"
+                        b"\r\n" + latest + b"\r\n"
                     )
-                last_sent = len(frames)
-            elif frames:
-                # Resend last frame to keep connection alive
-                frame = frames[-1]
-                yield (
-                    b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n"
-                    b"Content-Length: " + str(len(frame)).encode() + b"\r\n"
-                    b"\r\n" + frame + b"\r\n"
-                )
+                    last_hash = current_hash
             
-            await asyncio.sleep(0.05)  # ~20 FPS
+            await asyncio.sleep(0.033)
     
     return StreamingResponse(
         generate(),
@@ -377,7 +358,6 @@ async def video_feed():
 
 @app.get("/video-feed-direct")
 async def video_feed_direct():
-    """Direct passthrough of ESP32 MJPEG stream"""
     async def passthrough():
         while True:
             async with mjpeg_lock:
@@ -483,12 +463,9 @@ def latest_frame():
         raise HTTPException(404, "No frames available")
     return FileResponse(path, media_type="image/jpeg")
 
-# ================= UPLOAD (for capture mode) =================
-from fastapi import UploadFile, File
-
+# ================= UPLOAD =================
 @app.post("/upload")
 async def upload_image(file: UploadFile = File(...)):
-    """Handle single image upload from ESP32 capture mode"""
     filename = f"capture_{int(time.time())}.jpg"
     path = os.path.join(UPLOAD_DIR, filename)
     
@@ -496,11 +473,9 @@ async def upload_image(file: UploadFile = File(...)):
     with open(path, "wb") as f:
         f.write(content)
     
-    # Update latest frame
     global latest_frame_path
     latest_frame_path = path
     
-    # Log to DB
     db = SessionLocal()
     try:
         db.add(ImageLog(filename=filename))
@@ -522,3 +497,14 @@ def status():
 @app.get("/ping")
 def ping():
     return {"status": "alive"}
+
+@app.get("/")
+def root():
+    return {
+        "status": "ok",
+        "endpoints": {
+            "websocket": "/ws/mjpeg",
+            "video": "/video-feed",
+            "api": "/ping"
+        }
+    }
