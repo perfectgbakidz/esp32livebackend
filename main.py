@@ -181,8 +181,7 @@ def detect_faces(frame):
 
     faces = []
     for i in range(detections.shape[2]):
-        conf = detections[0, 0, i, 2]
-        if conf > 0.6:
+        if detections[0, 0, i, 2] > 0.6:
             box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
             x1, y1, x2, y2 = box.astype(int)
             face = frame[y1:y2, x1:x2]
@@ -202,7 +201,13 @@ def match_face(embedding, db):
             return f.name
     return "Unknown"
 
-# ================= UPLOAD (CORE LOGIC) =================
+def get_latest_image():
+    files = sorted(os.listdir(UPLOAD_DIR))
+    if not files:
+        return None
+    return os.path.join(UPLOAD_DIR, files[-1])
+
+# ================= UPLOAD =================
 @app.post("/upload")
 async def upload(request: Request, db: Session = Depends(get_db)):
     body = await request.body()
@@ -215,7 +220,7 @@ async def upload(request: Request, db: Session = Depends(get_db)):
     db.add(ImageLog(filename=filename))
     db.commit()
 
-    # 🔥 AI PROCESSING
+    # AI PROCESS
     img = cv2.imread(path)
     faces = detect_faces(img)
 
@@ -232,19 +237,47 @@ async def upload(request: Request, db: Session = Depends(get_db)):
 
     return {"status": result, "name": name}
 
-# ================= LIVE FRAME =================
+# ================= RECOGNIZE =================
+@app.get("/recognize")
+def recognize(db: Session = Depends(get_db)):
+    path = get_latest_image()
+    if not path:
+        return {"error": "No images"}
+
+    img = cv2.imread(path)
+    faces = detect_faces(img)
+
+    if not faces:
+        return {"status": "no face"}
+
+    name = match_face(get_embedding(faces[0]), db)
+
+    return {
+        "status": "known" if name != "Unknown" else "unknown",
+        "name": name
+    }
+
+# ================= IMAGES =================
+@app.get("/images")
+def list_images(db: Session = Depends(get_db)):
+    imgs = db.query(ImageLog).all()
+    return [{"file": i.filename, "time": i.created_at} for i in imgs]
+
+# ================= LATEST FRAME =================
 @app.get("/latest-frame")
 def latest_frame():
-    files = sorted(os.listdir(UPLOAD_DIR))
-    if not files:
+    path = get_latest_image()
+    if not path:
         return {"error": "no frames"}
 
-    path = os.path.join(UPLOAD_DIR, files[-1])
     return FileResponse(path, media_type="image/jpeg")
 
 # ================= COMMAND =================
 @app.post("/set-command")
 def set_command(mode: str, db: Session = Depends(get_db)):
+    if mode not in ["stream", "capture", "idle"]:
+        raise HTTPException(400, "Invalid mode")
+
     cmd = db.query(Command).first()
     if not cmd:
         cmd = Command(mode=mode)
