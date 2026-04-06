@@ -9,6 +9,7 @@ from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from pydantic import BaseModel
 import os, cv2, numpy as np, time, requests
+import hashlib
 
 # ================= CONFIG =================
 SECRET_KEY = "SUPER_SECRET_KEY" 
@@ -92,11 +93,14 @@ app.add_middleware(
 pwd_context = CryptContext(schemes=["bcrypt"])
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
+
 def hash_password(pw):
-    return pwd_context.hash(pw)
+    pw_hash = hashlib.sha256(pw.encode()).hexdigest()
+    return pwd_context.hash(pw_hash)
 
 def verify_password(pw, hashed):
-    return pwd_context.verify(pw, hashed)
+    pw_hash = hashlib.sha256(pw.encode()).hexdigest()
+    return pwd_context.verify(pw_hash, hashed)
 
 def create_token(data):
     data["exp"] = datetime.utcnow() + timedelta(minutes=60)
