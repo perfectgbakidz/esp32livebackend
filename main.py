@@ -1,7 +1,9 @@
+# ================= IMPORTS =================
 from fastapi import FastAPI, Request, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import create_engine, Column, Integer, String, DateTime
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 from jose import jwt
@@ -23,11 +25,22 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(UNKNOWN_DIR, exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
+# ================= STATIC =================
+app = FastAPI()
+app.mount("/static/images", StaticFiles(directory=UPLOAD_DIR), name="images")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ================= MODEL DOWNLOAD =================
 def download_drive_file(file_id, destination):
     if os.path.exists(destination):
         return
-
     URL = "https://drive.google.com/uc?export=download"
     session = requests.Session()
     response = session.get(URL, params={"id": file_id}, stream=True)
@@ -59,7 +72,6 @@ embedder = None
 
 def load_models():
     global detector, embedder
-
     download_drive_file(FACE_PROTO_ID, FACE_PROTO_PATH)
     download_drive_file(FACE_MODEL_ID, FACE_MODEL_PATH)
     download_drive_file(EMBED_MODEL_ID, EMBED_MODEL_PATH)
@@ -72,39 +84,6 @@ engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
-# ================= APP =================
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ================= AUTH =================
-pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
-
-def hash_password(pw):
-    return pwd_context.hash(pw)
-
-def verify_password(pw, hashed):
-    return pwd_context.verify(pw, hashed)
-
-def create_token(data):
-    data["exp"] = datetime.utcnow() + timedelta(minutes=60)
-    return jwt.encode(data, SECRET_KEY, algorithm=ALGORITHM)
-
-def get_current_user(token: str = Depends(oauth2_scheme)):
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload["sub"]
-    except:
-        raise HTTPException(401, "Invalid token")
-
-# ================= MODELS =================
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
@@ -130,13 +109,29 @@ class Command(Base):
 
 Base.metadata.create_all(bind=engine)
 
+# ================= AUTH =================
+pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+def hash_password(pw): return pwd_context.hash(pw)
+def verify_password(pw, hashed): return pwd_context.verify(pw, hashed)
+
+def create_token(data):
+    data["exp"] = datetime.utcnow() + timedelta(minutes=60)
+    return jwt.encode(data, SECRET_KEY, algorithm=ALGORITHM)
+
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload["sub"]
+    except:
+        raise HTTPException(401, "Invalid token")
+
 # ================= DB DEP =================
 def get_db():
     db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+    try: yield db
+    finally: db.close()
 
 # ================= STARTUP =================
 @app.on_event("startup")
@@ -157,7 +152,6 @@ class UserCreate(BaseModel):
 def register(data: UserCreate, db: Session = Depends(get_db)):
     if db.query(User).filter_by(username=data.username).first():
         raise HTTPException(400, "User exists")
-
     db.add(User(username=data.username, password=hash_password(data.password)))
     db.commit()
     return {"msg": "registered"}
@@ -167,28 +161,27 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
     user = db.query(User).filter_by(username=form.username).first()
     if not user or not verify_password(form.password, user.password):
         raise HTTPException(401, "Invalid credentials")
-
     return {"access_token": create_token({"sub": user.username})}
 
 # ================= FACE UTILS =================
 def detect_faces(frame):
     h, w = frame.shape[:2]
-    blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300), (104, 177, 123))
+    blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300), (104,177,123))
     detector.setInput(blob)
     detections = detector.forward()
 
     faces = []
     for i in range(detections.shape[2]):
-        if detections[0, 0, i, 2] > 0.6:
-            box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
-            x1, y1, x2, y2 = box.astype(int)
-            face = frame[y1:y2, x1:x2]
+        if detections[0,0,i,2] > 0.6:
+            box = detections[0,0,i,3:7]*np.array([w,h,w,h])
+            x1,y1,x2,y2 = box.astype(int)
+            face = frame[y1:y2,x1:x2]
             if face.size > 0:
                 faces.append(face)
     return faces
 
 def get_embedding(face):
-    blob = cv2.dnn.blobFromImage(face, 1/255, (96, 96), (0,0,0), swapRB=True)
+    blob = cv2.dnn.blobFromImage(face,1/255,(96,96),(0,0,0),swapRB=True)
     embedder.setInput(blob)
     return embedder.forward()[0]
 
@@ -201,9 +194,7 @@ def match_face(embedding, db):
 
 def get_latest_image():
     files = sorted(os.listdir(UPLOAD_DIR))
-    if not files:
-        return None
-    return os.path.join(UPLOAD_DIR, files[-1])
+    return os.path.join(UPLOAD_DIR, files[-1]) if files else None
 
 # ================= WEBSOCKET =================
 active_clients = []
@@ -218,13 +209,11 @@ async def websocket_stream(websocket: WebSocket):
             data = await websocket.receive()
 
             if "bytes" in data:
-                frame = data["bytes"]
-
                 filename = f"{int(time.time())}.jpg"
                 path = os.path.join(UPLOAD_DIR, filename)
 
                 with open(path, "wb") as f:
-                    f.write(frame)
+                    f.write(data["bytes"])
 
                 db = SessionLocal()
                 db.add(ImageLog(filename=filename))
@@ -237,19 +226,19 @@ async def websocket_stream(websocket: WebSocket):
     except WebSocketDisconnect:
         active_clients.remove(websocket)
 
-# ================= COMMAND PUSH =================
 def broadcast_command(mode: str):
     for client in active_clients:
-        try:
-            asyncio.create_task(client.send_text(mode))
-        except:
-            pass
+        asyncio.create_task(client.send_text(mode))
 
 # ================= COMMAND =================
 @app.post("/set-command")
-def set_command(mode: str, db: Session = Depends(get_db)):
-    if mode not in ["stream", "capture", "idle"]:
-        raise HTTPException(400, "Invalid mode")
+def set_command(
+    mode: str,
+    user: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    if mode not in ["stream","capture","idle"]:
+        raise HTTPException(400,"Invalid mode")
 
     cmd = db.query(Command).first()
     if not cmd:
@@ -259,45 +248,79 @@ def set_command(mode: str, db: Session = Depends(get_db)):
         cmd.mode = mode
 
     db.commit()
-
-    # 🔥 REAL-TIME PUSH
     broadcast_command(mode)
 
     return {"mode": mode}
 
-@app.get("/camera/command")
-def get_command(db: Session = Depends(get_db)):
-    cmd = db.query(Command).first()
-    return cmd.mode if cmd else "idle"
+# ================= FACE ENROLL =================
+@app.post("/create-embedding")
+def create_embedding(
+    name: str,
+    user: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    path = get_latest_image()
+    if not path:
+        raise HTTPException(400,"No image")
 
-# ================= MJPEG STREAM =================
-def mjpeg_generator():
+    img = cv2.imread(path)
+    faces = detect_faces(img)
+    if not faces:
+        raise HTTPException(400,"No face found")
+
+    emb = get_embedding(faces[0])
+
+    db.add(Face(name=name, embedding=",".join(map(str,emb))))
+    db.commit()
+
+    return {"status":"saved","name":name}
+
+# ================= RECOGNIZE =================
+@app.get("/recognize")
+def recognize(db: Session = Depends(get_db)):
+    path = get_latest_image()
+    if not path:
+        return {"error":"No images"}
+
+    img = cv2.imread(path)
+    faces = detect_faces(img)
+    if not faces:
+        return {"status":"no face"}
+
+    name = match_face(get_embedding(faces[0]), db)
+
+    return {
+        "status":"known" if name!="Unknown" else "unknown",
+        "name":name
+    }
+
+# ================= IMAGES =================
+@app.get("/images")
+def list_images(db: Session = Depends(get_db)):
+    imgs = db.query(ImageLog).all()
+    return [{"file":i.filename,"time":i.created_at} for i in imgs]
+
+# ================= STREAM =================
+def mjpeg():
     while True:
         path = get_latest_image()
         if path:
-            with open(path, "rb") as f:
+            with open(path,"rb") as f:
                 frame = f.read()
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
-            )
+            yield b"--frame\r\nContent-Type:image/jpeg\r\n\r\n"+frame+b"\r\n"
         time.sleep(0.1)
 
 @app.get("/video-feed")
 def video_feed():
-    return StreamingResponse(
-        mjpeg_generator(),
-        media_type="multipart/x-mixed-replace; boundary=frame"
-    )
+    return StreamingResponse(mjpeg(), media_type="multipart/x-mixed-replace; boundary=frame")
 
-# ================= EXISTING ROUTES (UNCHANGED) =================
 @app.get("/latest-frame")
 def latest_frame():
     path = get_latest_image()
     if not path:
-        return {"error": "no frames"}
+        return {"error":"no frames"}
     return FileResponse(path, media_type="image/jpeg")
 
 @app.get("/ping")
 def ping():
-    return {"status": "alive"}
+    return {"status":"alive"}
