@@ -296,6 +296,26 @@ def video_feed(db: Session = Depends(get_db)):
     return StreamingResponse(gen_frames(db),
         media_type="multipart/x-mixed-replace; boundary=frame")
 
+@app.post("/set-command")
+def set_command(mode: str, db: Session = Depends(get_db)):
+    if mode not in ["stream", "capture", "idle"]:
+        raise HTTPException(400, "Invalid mode")
+
+    cmd = db.query(Command).first()
+    if not cmd:
+        cmd = Command(mode=mode)
+        db.add(cmd)
+    else:
+        cmd.mode = mode
+
+    db.commit()
+    return {"mode": mode}
+    
+@app.get("/camera/command")
+def get_command(db: Session = Depends(get_db)):
+    cmd = db.query(Command).first()
+    return cmd.mode if cmd else "idle"
+
 @app.get("/ping")
 def ping():
     return {"status": "alive"}
