@@ -50,6 +50,7 @@ latest_frame_path: Optional[str] = None
 esp32_connected = False
 active_clients: List[WebSocket] = []
 esp32_socket: Optional[WebSocket] = None
+last_esp32_message = 0  # Track last message time
 
 # ================= MODEL DOWNLOAD =================
 def download_drive_file(file_id, destination):
@@ -163,26 +164,32 @@ def startup():
 @app.websocket("/ws/mjpeg")
 async def websocket_mjpeg(websocket: WebSocket):
     """ESP32 MJPEG streaming endpoint with keepalive handling"""
-    global mjpeg_buffer, esp32_connected, esp32_socket
+    global mjpeg_buffer, esp32_connected, esp32_socket, last_esp32_message
     
     print(f"WS connection from {websocket.client}")
     
-    # Accept with custom ping interval (30 seconds) and no timeout
     await websocket.accept()
     
-    # Configure WebSocket to be more tolerant
     esp32_socket = websocket
     esp32_connected = True
+    last_esp32_message = time.time()
     print("ESP32 connected")
     
     try:
         while True:
-            # Use timeout to allow periodic checks
+            # Check if connection is stale (no message for 40 seconds)
+            if time.time() - last_esp32_message > 40:
+                print("Connection stale, closing")
+                break
+            
             try:
+                # Short timeout to allow periodic stale checks
                 message = await asyncio.wait_for(
                     websocket.receive(), 
-                    timeout=25.0  # Slightly less than 30s ping interval
+                    timeout=5.0
                 )
+                
+                last_esp32_message = time.time()
                 
                 if "text" in message:
                     text = message["text"]
@@ -190,6 +197,19 @@ async def websocket_mjpeg(websocket: WebSocket):
                     
                     # Handle pong response
                     if text == "pong":
+                        continue
+                    # Handle auto-resume request from ESP32
+                    elif text == "stream":
+                        # Update command in DB
+                        db = SessionLocal()
+                        try:
+                            cmd = db.query(Command).first()
+                            if cmd:
+                                cmd.mode = "stream"
+                                db.commit()
+                        finally:
+                            db.close()
+                        await broadcast_to_clients("mode:stream")
                         continue
                         
                 elif "bytes" in message:
@@ -209,8 +229,8 @@ async def websocket_mjpeg(websocket: WebSocket):
                 if esp32_socket and esp32_connected:
                     try:
                         await esp32_socket.send_text("ping")
-                    except:
-                        print("Failed to send ping, connection dead")
+                    except Exception as e:
+                        print(f"Failed to send ping: {e}")
                         break
                 continue
                 
@@ -515,7 +535,8 @@ def status():
     return {
         "esp32_connected": esp32_connected,
         "buffer_size": len(mjpeg_buffer),
-        "active_clients": len(active_clients)
+        "active_clients": len(active_clients),
+        "last_esp32_message": last_esp32_message
     }
 
 @app.get("/ping")
