@@ -11,6 +11,8 @@ from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from pydantic import BaseModel
 import os, cv2, numpy as np, time, requests, asyncio
+from typing import List, Dict, Optional
+import io
 
 # ================= CONFIG =================
 SECRET_KEY = "SUPER_SECRET_KEY"
@@ -36,6 +38,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ================= GLOBAL STATE =================
+# MJPEG streaming state
+mjpeg_buffer = bytearray()
+mjpeg_lock = asyncio.Lock()
+frame_event = asyncio.Event()
+latest_frame_path: Optional[str] = None
+esp32_connected = False
+
+# Active WebSocket clients
+active_clients: List[WebSocket] = []
+esp32_socket: Optional[WebSocket] = None
 
 # ================= MODEL DOWNLOAD =================
 def download_drive_file(file_id, destination):
@@ -143,6 +157,164 @@ def startup():
         db.commit()
     db.close()
 
+# ================= MJPEG PARSING =================
+BOUNDARY = b"--123456789000000000000987654321"
+
+def extract_frames_from_mjpeg(data: bytes) -> list:
+    """Extract individual JPEG frames from MJPEG stream"""
+    frames = []
+    parts = data.split(BOUNDARY)
+    
+    for part in parts:
+        if b"Content-Type: image/jpeg" in part:
+            # Find the double CRLF that separates headers from body
+            header_end = part.find(b"\r\n\r\n")
+            if header_end != -1:
+                jpeg_data = part[header_end + 4:]  # Skip \r\n\r\n
+                # Remove trailing \r\n if present
+                if jpeg_data.endswith(b"\r\n"):
+                    jpeg_data = jpeg_data[:-2]
+                if jpeg_data.startswith(b"\r\n"):
+                    jpeg_data = jpeg_data[2:]
+                if len(jpeg_data) > 100:  # Valid JPEG check
+                    frames.append(jpeg_data)
+    
+    return frames
+
+# ================= ESP32 WEBSOCKET (MJPEG STREAM) =================
+@app.websocket("/ws/mjpeg")
+async def websocket_mjpeg(websocket: WebSocket):
+    global mjpeg_buffer, esp32_connected, esp32_socket
+    
+    await websocket.accept()
+    esp32_socket = websocket
+    esp32_connected = True
+    
+    print("ESP32 MJPEG client connected")
+    
+    try:
+        while True:
+            message = await websocket.receive()
+            
+            if "text" in message:
+                text = message["text"]
+                print(f"ESP32 Text: {text}")
+                
+                if "MJPEG_READY" in text:
+                    # ESP32 is ready to stream
+                    pass
+                    
+            elif "bytes" in message:
+                data = message["bytes"]
+                
+                async with mjpeg_lock:
+                    mjpeg_buffer.extend(data)
+                    
+                    # Keep buffer size manageable (last ~2MB)
+                    if len(mjpeg_buffer) > 2000000:
+                        mjpeg_buffer = mjpeg_buffer[-1500000:]
+                
+                # Extract and save latest frame for processing
+                frames = extract_frames_from_mjpeg(bytes(mjpeg_buffer))
+                if frames:
+                    latest_frame = frames[-1]
+                    await save_frame_for_processing(latest_frame)
+                    
+                # Notify waiting clients
+                frame_event.set()
+                frame_event.clear()
+                
+    except WebSocketDisconnect:
+        print("ESP32 MJPEG client disconnected")
+        esp32_connected = False
+        esp32_socket = None
+
+async def save_frame_for_processing(jpeg_data: bytes):
+    """Save latest frame to disk for face recognition"""
+    global latest_frame_path
+    
+    filename = f"latest_{int(time.time())}.jpg"
+    path = os.path.join(UPLOAD_DIR, filename)
+    
+    with open(path, "wb") as f:
+        f.write(jpeg_data)
+    
+    latest_frame_path = path
+    
+    # Cleanup old files, keep last 50
+    files = sorted(os.listdir(UPLOAD_DIR))
+    if len(files) > 50:
+        for old_file in files[:-50]:
+            try:
+                os.remove(os.path.join(UPLOAD_DIR, old_file))
+            except:
+                pass
+    
+    # Log to DB
+    db = SessionLocal()
+    try:
+        db.add(ImageLog(filename=filename))
+        db.commit()
+    finally:
+        db.close()
+
+# ================= FRONTEND WEBSOCKET (for commands/notifications) =================
+@app.websocket("/ws/client")
+async def websocket_client(websocket: WebSocket):
+    await websocket.accept()
+    active_clients.append(websocket)
+    
+    try:
+        while True:
+            # Keep connection alive, handle client commands if needed
+            data = await websocket.receive_text()
+            # Handle client->server messages if needed
+    except WebSocketDisconnect:
+        active_clients.remove(websocket)
+
+# ================= BROADCAST =================
+async def broadcast_to_clients(message: str):
+    disconnected = []
+    for client in active_clients:
+        try:
+            await client.send_text(message)
+        except:
+            disconnected.append(client)
+    
+    for client in disconnected:
+        if client in active_clients:
+            active_clients.remove(client)
+
+# ================= COMMAND =================
+@app.post("/set-command")
+def set_command(
+    mode: str,
+    user: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    global esp32_socket
+    
+    if mode not in ["stream", "capture", "idle"]:
+        raise HTTPException(400, "Invalid mode")
+
+    cmd = db.query(Command).first()
+    if not cmd:
+        cmd = Command(mode=mode)
+        db.add(cmd)
+    else:
+        cmd.mode = mode
+
+    db.commit()
+    
+    # Send command to ESP32 via WebSocket
+    if esp32_socket and esp32_connected:
+        asyncio.create_task(esp32_socket.send_text(mode))
+    
+    # Notify frontend clients
+    asyncio.create_task(broadcast_to_clients(f"mode:{mode}"))
+
+    return {"mode": mode}
+
 # ================= AUTH ROUTES =================
 class UserCreate(BaseModel):
     username: str
@@ -162,6 +334,62 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
     if not user or not verify_password(form.password, user.password):
         raise HTTPException(401, "Invalid credentials")
     return {"access_token": create_token({"sub": user.username})}
+
+# ================= VIDEO STREAMING =================
+@app.get("/video-feed")
+async def video_feed():
+    """HTTP MJPEG stream for frontend"""
+    async def generate():
+        last_sent = 0
+        while True:
+            async with mjpeg_lock:
+                current_buffer = bytes(mjpeg_buffer)
+            
+            # Extract frames
+            frames = extract_frames_from_mjpeg(current_buffer)
+            
+            if frames and len(frames) > last_sent:
+                # Send new frames only
+                for i in range(last_sent, len(frames)):
+                    frame = frames[i]
+                    yield (
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n"
+                        b"Content-Length: " + str(len(frame)).encode() + b"\r\n"
+                        b"\r\n" + frame + b"\r\n"
+                    )
+                last_sent = len(frames)
+            elif frames:
+                # Resend last frame to keep connection alive
+                frame = frames[-1]
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Content-Length: " + str(len(frame)).encode() + b"\r\n"
+                    b"\r\n" + frame + b"\r\n"
+                )
+            
+            await asyncio.sleep(0.05)  # ~20 FPS
+    
+    return StreamingResponse(
+        generate(),
+        media_type="multipart/x-mixed-replace; boundary=frame"
+    )
+
+@app.get("/video-feed-direct")
+async def video_feed_direct():
+    """Direct passthrough of ESP32 MJPEG stream"""
+    async def passthrough():
+        while True:
+            async with mjpeg_lock:
+                if mjpeg_buffer:
+                    yield bytes(mjpeg_buffer)
+            await asyncio.sleep(0.05)
+    
+    return StreamingResponse(
+        passthrough(),
+        media_type="multipart/x-mixed-replace; boundary=123456789000000000000987654321"
+    )
 
 # ================= FACE UTILS =================
 def detect_faces(frame):
@@ -192,65 +420,8 @@ def match_face(embedding, db):
             return f.name
     return "Unknown"
 
-def get_latest_image():
-    files = sorted(os.listdir(UPLOAD_DIR))
-    return os.path.join(UPLOAD_DIR, files[-1]) if files else None
-
-# ================= WEBSOCKET =================
-active_clients = []
-
-@app.websocket("/ws/stream")
-async def websocket_stream(websocket: WebSocket):
-    await websocket.accept()
-    active_clients.append(websocket)
-
-    try:
-        while True:
-            data = await websocket.receive()
-
-            if "bytes" in data:
-                filename = f"{int(time.time())}.jpg"
-                path = os.path.join(UPLOAD_DIR, filename)
-
-                with open(path, "wb") as f:
-                    f.write(data["bytes"])
-
-                db = SessionLocal()
-                db.add(ImageLog(filename=filename))
-                db.commit()
-                db.close()
-
-            elif "text" in data:
-                print("ESP32:", data["text"])
-
-    except WebSocketDisconnect:
-        active_clients.remove(websocket)
-
-def broadcast_command(mode: str):
-    for client in active_clients:
-        asyncio.create_task(client.send_text(mode))
-
-# ================= COMMAND =================
-@app.post("/set-command")
-def set_command(
-    mode: str,
-    user: str = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    if mode not in ["stream","capture","idle"]:
-        raise HTTPException(400,"Invalid mode")
-
-    cmd = db.query(Command).first()
-    if not cmd:
-        cmd = Command(mode=mode)
-        db.add(cmd)
-    else:
-        cmd.mode = mode
-
-    db.commit()
-    broadcast_command(mode)
-
-    return {"mode": mode}
+def get_latest_image_path():
+    return latest_frame_path
 
 # ================= FACE ENROLL =================
 @app.post("/create-embedding")
@@ -259,68 +430,96 @@ def create_embedding(
     user: str = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    path = get_latest_image()
-    if not path:
-        raise HTTPException(400,"No image")
+    path = get_latest_image_path()
+    if not path or not os.path.exists(path):
+        raise HTTPException(400, "No image available")
 
     img = cv2.imread(path)
+    if img is None:
+        raise HTTPException(400, "Cannot read image")
+        
     faces = detect_faces(img)
     if not faces:
-        raise HTTPException(400,"No face found")
+        raise HTTPException(400, "No face found")
 
     emb = get_embedding(faces[0])
 
-    db.add(Face(name=name, embedding=",".join(map(str,emb))))
+    db.add(Face(name=name, embedding=",".join(map(str, emb))))
     db.commit()
 
-    return {"status":"saved","name":name}
+    return {"status": "saved", "name": name}
 
 # ================= RECOGNIZE =================
 @app.get("/recognize")
 def recognize(db: Session = Depends(get_db)):
-    path = get_latest_image()
-    if not path:
-        return {"error":"No images"}
+    path = get_latest_image_path()
+    if not path or not os.path.exists(path):
+        return {"error": "No images available"}
 
     img = cv2.imread(path)
+    if img is None:
+        return {"error": "Cannot read image"}
+        
     faces = detect_faces(img)
     if not faces:
-        return {"status":"no face"}
+        return {"status": "no face"}
 
     name = match_face(get_embedding(faces[0]), db)
 
     return {
-        "status":"known" if name!="Unknown" else "unknown",
-        "name":name
+        "status": "known" if name != "Unknown" else "unknown",
+        "name": name
     }
 
 # ================= IMAGES =================
 @app.get("/images")
 def list_images(db: Session = Depends(get_db)):
-    imgs = db.query(ImageLog).all()
-    return [{"file":i.filename,"time":i.created_at} for i in imgs]
-
-# ================= STREAM =================
-def mjpeg():
-    while True:
-        path = get_latest_image()
-        if path:
-            with open(path,"rb") as f:
-                frame = f.read()
-            yield b"--frame\r\nContent-Type:image/jpeg\r\n\r\n"+frame+b"\r\n"
-        time.sleep(0.1)
-
-@app.get("/video-feed")
-def video_feed():
-    return StreamingResponse(mjpeg(), media_type="multipart/x-mixed-replace; boundary=frame")
+    imgs = db.query(ImageLog).order_by(ImageLog.created_at.desc()).limit(100).all()
+    return [{"file": i.filename, "time": i.created_at} for i in imgs]
 
 @app.get("/latest-frame")
 def latest_frame():
-    path = get_latest_image()
-    if not path:
-        return {"error":"no frames"}
+    path = get_latest_image_path()
+    if not path or not os.path.exists(path):
+        raise HTTPException(404, "No frames available")
     return FileResponse(path, media_type="image/jpeg")
+
+# ================= UPLOAD (for capture mode) =================
+from fastapi import UploadFile, File
+
+@app.post("/upload")
+async def upload_image(file: UploadFile = File(...)):
+    """Handle single image upload from ESP32 capture mode"""
+    filename = f"capture_{int(time.time())}.jpg"
+    path = os.path.join(UPLOAD_DIR, filename)
+    
+    content = await file.read()
+    with open(path, "wb") as f:
+        f.write(content)
+    
+    # Update latest frame
+    global latest_frame_path
+    latest_frame_path = path
+    
+    # Log to DB
+    db = SessionLocal()
+    try:
+        db.add(ImageLog(filename=filename))
+        db.commit()
+    finally:
+        db.close()
+    
+    return {"status": "uploaded", "filename": filename}
+
+# ================= STATUS =================
+@app.get("/status")
+def status():
+    return {
+        "esp32_connected": esp32_connected,
+        "buffer_size": len(mjpeg_buffer),
+        "active_clients": len(active_clients)
+    }
 
 @app.get("/ping")
 def ping():
-    return {"status":"alive"}
+    return {"status": "alive"}
