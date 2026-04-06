@@ -27,9 +27,10 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(UNKNOWN_DIR, exist_ok=True)
 
 # ================= LOAD MODELS =================
-FACE_PROTO = "models/deploy.prototxt"
-FACE_MODEL = "models/res10_300x300_ssd_iter_140000.caffemodel"
-EMBED_MODEL = "models/nn4.small2.v1.t7"
+
+FACE_PROTO = "https://drive.google.com/file/d/1eq0loGlVgjR6W8-CZ8Qrbc2fHZxo2207/view"
+FACE_MODEL = "https://drive.google.com/file/d/14iQZzrsU_MB8IRLCTZyXmQBjZtyB0lCz/view"
+EMBED_MODEL = "https://drive.google.com/file/d/1l7eEf-YJ6cHEw7tZ1EFjgDKjhaVwwhyr/view"
 
 detector = cv2.dnn.readNetFromCaffe(FACE_PROTO, FACE_MODEL)
 embedder = cv2.dnn.readNetFromTorch(EMBED_MODEL)
