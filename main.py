@@ -1,6 +1,6 @@
-from fastapi import FastAPI, Request, Depends, HTTPException
+from fastapi import FastAPI, Request, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy import create_engine, Column, Integer, String, DateTime
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
@@ -8,7 +8,7 @@ from jose import jwt
 from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from pydantic import BaseModel
-import os, cv2, numpy as np, time, requests
+import os, cv2, numpy as np, time, requests, asyncio
 
 # ================= CONFIG =================
 SECRET_KEY = "SUPER_SECRET_KEY"
@@ -30,10 +30,9 @@ def download_drive_file(file_id, destination):
 
     URL = "https://drive.google.com/uc?export=download"
     session = requests.Session()
-
     response = session.get(URL, params={"id": file_id}, stream=True)
-    token = None
 
+    token = None
     for key, value in response.cookies.items():
         if key.startswith("download_warning"):
             token = value
@@ -143,7 +142,6 @@ def get_db():
 @app.on_event("startup")
 def startup():
     load_models()
-
     db = SessionLocal()
     if not db.query(Command).first():
         db.add(Command(mode="idle"))
@@ -207,70 +205,45 @@ def get_latest_image():
         return None
     return os.path.join(UPLOAD_DIR, files[-1])
 
-# ================= UPLOAD =================
-@app.post("/upload")
-async def upload(request: Request, db: Session = Depends(get_db)):
-    body = await request.body()
-    filename = f"{int(time.time())}.jpg"
-    path = os.path.join(UPLOAD_DIR, filename)
+# ================= WEBSOCKET =================
+active_clients = []
 
-    with open(path, "wb") as f:
-        f.write(body)
+@app.websocket("/ws/stream")
+async def websocket_stream(websocket: WebSocket):
+    await websocket.accept()
+    active_clients.append(websocket)
 
-    db.add(ImageLog(filename=filename))
-    db.commit()
+    try:
+        while True:
+            data = await websocket.receive()
 
-    # AI PROCESS
-    img = cv2.imread(path)
-    faces = detect_faces(img)
+            if "bytes" in data:
+                frame = data["bytes"]
 
-    result = "no face"
-    name = None
+                filename = f"{int(time.time())}.jpg"
+                path = os.path.join(UPLOAD_DIR, filename)
 
-    if faces:
-        emb = get_embedding(faces[0])
-        name = match_face(emb, db)
-        result = "known" if name != "Unknown" else "unknown"
+                with open(path, "wb") as f:
+                    f.write(frame)
 
-        if result == "unknown":
-            cv2.imwrite(os.path.join(UNKNOWN_DIR, filename), img)
+                db = SessionLocal()
+                db.add(ImageLog(filename=filename))
+                db.commit()
+                db.close()
 
-    return {"status": result, "name": name}
+            elif "text" in data:
+                print("ESP32:", data["text"])
 
-# ================= RECOGNIZE =================
-@app.get("/recognize")
-def recognize(db: Session = Depends(get_db)):
-    path = get_latest_image()
-    if not path:
-        return {"error": "No images"}
+    except WebSocketDisconnect:
+        active_clients.remove(websocket)
 
-    img = cv2.imread(path)
-    faces = detect_faces(img)
-
-    if not faces:
-        return {"status": "no face"}
-
-    name = match_face(get_embedding(faces[0]), db)
-
-    return {
-        "status": "known" if name != "Unknown" else "unknown",
-        "name": name
-    }
-
-# ================= IMAGES =================
-@app.get("/images")
-def list_images(db: Session = Depends(get_db)):
-    imgs = db.query(ImageLog).all()
-    return [{"file": i.filename, "time": i.created_at} for i in imgs]
-
-# ================= LATEST FRAME =================
-@app.get("/latest-frame")
-def latest_frame():
-    path = get_latest_image()
-    if not path:
-        return {"error": "no frames"}
-
-    return FileResponse(path, media_type="image/jpeg")
+# ================= COMMAND PUSH =================
+def broadcast_command(mode: str):
+    for client in active_clients:
+        try:
+            asyncio.create_task(client.send_text(mode))
+        except:
+            pass
 
 # ================= COMMAND =================
 @app.post("/set-command")
@@ -286,6 +259,10 @@ def set_command(mode: str, db: Session = Depends(get_db)):
         cmd.mode = mode
 
     db.commit()
+
+    # 🔥 REAL-TIME PUSH
+    broadcast_command(mode)
+
     return {"mode": mode}
 
 @app.get("/camera/command")
@@ -293,7 +270,34 @@ def get_command(db: Session = Depends(get_db)):
     cmd = db.query(Command).first()
     return cmd.mode if cmd else "idle"
 
-# ================= HEALTH =================
+# ================= MJPEG STREAM =================
+def mjpeg_generator():
+    while True:
+        path = get_latest_image()
+        if path:
+            with open(path, "rb") as f:
+                frame = f.read()
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+            )
+        time.sleep(0.1)
+
+@app.get("/video-feed")
+def video_feed():
+    return StreamingResponse(
+        mjpeg_generator(),
+        media_type="multipart/x-mixed-replace; boundary=frame"
+    )
+
+# ================= EXISTING ROUTES (UNCHANGED) =================
+@app.get("/latest-frame")
+def latest_frame():
+    path = get_latest_image()
+    if not path:
+        return {"error": "no frames"}
+    return FileResponse(path, media_type="image/jpeg")
+
 @app.get("/ping")
 def ping():
     return {"status": "alive"}
